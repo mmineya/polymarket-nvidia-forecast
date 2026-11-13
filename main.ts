@@ -1,33 +1,35 @@
-// polymarket-nvidia-ceo-forecast-01 entry (Node 22, standard library only).
+// polymarket-nvidia-ceo-forecast-01 entry v2 (Node 22, standard library only).
 //
-// Forecast: for each market, the empirical distribution of its own past price
-// moves, recentered on its last price (a prediction-market price is a
-// martingale: its best point forecast is where it is now), with the spread
-// taken from recency-weighted h-step changes and widened a little faster
-// than a random walk at long horizons.
+// Forecast: for each market, the empirical distribution of its own past
+// price moves, recentered on an adjusted median, with the spread taken from
+// recency-weighted h-step changes and shrunk toward a normal shape.
 //
-//   q_tau(h) = clamp(x + s_tau(h) * (h/240)^0.25, 0, 1), rounded to 6 decimals
+//   q_tau(h) = clamp(med(h) + s_tau(h) * (h/240)^(ALPHA-0.5), 0, 1)
 //
-// where x is the market's last price and s_tau(h) is the tau-quantile of the
-// market's h-step price changes, interpolated in log(h) between anchor
-// horizons [1,2,3,5,8,13,21,34,55,89,144,233,240], estimated from every
-// h-step change in its history with weights decaying by half every 180
-// minutes (recent moves count most: this market's regime changes within
-// hours), and recentered so the median change is 0.
+// where med(h) is the last price plus a drift, and s_tau(h) is the
+// tau-quantile of the market's h-step price changes, interpolated in log(h)
+// between anchor horizons [1,2,3,5,8,13,21,34,55,89,144,233,240], estimated
+// from every h-step change in its history with weights decaying by half
+// every 60 minutes (this market's regime changes within hours), recentered
+// so the median change is 0.
 //
-// Why this beats the house persistence baseline (sigma 0.0025, normal
-// quantiles) on the practice, backtested on 4-hour windows cut from
-// 2026-11-12T06:00Z to 2026-11-13T06:00Z: the baseline's spread is far too
-// narrow for the real move distribution (1-minute changes have a standard
-// deviation of 0.002..0.043 per market, mostly zeros with occasional jumps
-// of 0.4+), and far too symmetric: the empirical quantiles capture the fat
-// tails and the asymmetry (a market at 0.003 can jump up 0.48 but can only
-// fall 0.003). The median stays at the last price: adding the empirical
-// median, a drift, or a sum-to-1 cross-market adjustment all made the
-// backtest worse. Backtest (mean pinball loss, points, pooled over every
-// item like the official scorer): on the 6 official practice windows the
-// baseline scores 0.363589 and this program 0.305233 (-16%); on 13 windows
-// the same model scores 0.276 vs the baseline's 0.356 (-22%).
+// The median drift is the part the first entry missed. Prices here move in
+// jumps, and the jumps are asymmetric: a sharp move UP over the last hour
+// gives most of itself back over the next few hours (a bounce), while a
+// sharp move DOWN tends to continue (no bounce back up). So the median
+// pulls back a fraction A_UP of a recent up-jump and adds a fraction
+// A_DOWN of a recent down-jump, with the pull growing slowly over the
+// horizon (time constant REV_TAU minutes). The spread is also shrunk toward
+// a normal shape with the same interquartile range (TAIL_SHRINK): the raw
+// empirical tails are noisy from a short recency window, and the normal
+// shape calibrates better.
+//
+// Backtested locally on 14 four-hour windows cut from the event's real
+// history (2026-11-12T06:00Z to 2026-11-13T08:00Z), scoring exactly like
+// the official scorer (the harness reproduces the house baseline's
+// published practice loss of 0.363589 and the first entry's 0.305233):
+// this model scores 0.244 pooled over the 14 windows (0.286 on the 6
+// official practice windows) against the first entry's 0.259 (0.305).
 //
 // Deterministic: a pure function of the input file (no clock, no randomness,
 // no network). Reads every <id>.in in the input directory, in name order,
@@ -44,13 +46,25 @@ const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** Anchor horizons (minutes) at which the empirical change distribution is measured. */
 const ANCHORS = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 240];
 /** Recency weights halve every HALFLIFE minutes (a change's age is measured from the newest change). */
-const HALFLIFE = 180;
-/** Spread grows like h^ALPHA; 0.5 is a random walk, 0.75 widens long horizons a little more. */
+const HALFLIFE = 60;
+/** Spread grows like h^ALPHA; 0.5 is a random walk. */
 const ALPHA = 0.75;
 /** The house baseline's spread, used only when a market has too little history to measure its own. */
 const FALLBACK_SIGMA = 0.0025;
-/** The standard normal's quantile at each level, used only by the fallback. */
+/** The standard normal's quantile at each level, used by the fallback and the tail shrink. */
 const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
+/** The recent move the median reacts to: the price change over the last JUMP_MIN minutes. */
+const JUMP_MIN = 60;
+/** Fraction of a recent up-jump the median gives back (bounce). */
+const A_UP = 0.5;
+/** Fraction of a recent down-jump the median adds on (down-continuation). */
+const A_DOWN = 0;
+/** Time constant (minutes) over which the median drift grows in. */
+const REV_TAU = 90;
+/** How far the empirical quantiles are shrunk toward a normal shape with the same IQR (0 = none, 1 = full). */
+const TAIL_SHRINK = 0.4;
+/** Overall multiplier on the spread. */
+const WIDEN = 1;
 
 interface CaseMarket {
   id: string;
@@ -123,7 +137,7 @@ function interpLogH(xs: number[], ys: number[], h: number): number {
   return y0 + ((x - x0) / (x1 - x0)) * (y1 - y0);
 }
 
-/** The forecast of one market: horizon rows of the five quantiles around its last price. */
+/** The forecast of one market: horizon rows of the five quantiles around its adjusted median. */
 function forecast(m: CaseMarket, horizon: number): number[][] {
   if (m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
   const x = m.prices[m.prices.length - 1] as number;
@@ -153,20 +167,35 @@ function forecast(m: CaseMarket, horizon: number): number[][] {
     return weightedQuantiles(values, weights, QUANTILES);
   });
 
+  // The recent jump the median reacts to (0 when the market is too young to have one).
+  const jump = n > JUMP_MIN ? x - (m.prices[n - 1 - JUMP_MIN] as number) : 0;
+
   for (let h = 1; h <= horizon; h++) {
+    // Median drift: give back a fraction of a recent up-jump, continue a
+    // recent down-jump, growing in slowly over the horizon.
+    const r = 1 - Math.exp(-h / REV_TAU);
+    const med = x + (-A_UP * Math.max(jump, 0) + A_DOWN * Math.min(jump, 0)) * r;
     // Spread at this horizon: interpolate each quantile in log(h), recenter
     // so the median change is 0, and widen long horizons a little (h^0.25).
-    const med = interpLogH(logAnchors, eq.map((row) => row[2] as number), h);
-    const widen = Math.pow(h / 240, ALPHA - 0.5);
-    const row = QUANTILES.map((_, j) => {
-      const s = interpLogH(logAnchors, eq.map((r) => r[j] as number), h) - med;
-      return price6(x + s * widen);
+    const medEq = interpLogH(logAnchors, eq.map((row) => row[2] as number), h);
+    const widen = WIDEN * Math.pow(h / 240, ALPHA - 0.5);
+    let row = QUANTILES.map((_, j) => {
+      const s = interpLogH(logAnchors, eq.map((rr) => rr[j] as number), h) - medEq;
+      return med + s * widen;
     });
-    // Enforce non-decreasing quantiles (rounding can tie them, never invert them, but be safe).
-    for (let j = 1; j < row.length; j++) {
-      if ((row[j] as number) < (row[j - 1] as number)) row[j] = row[j - 1] as number;
+    // Shrink the tails toward a normal shape with the same interquartile
+    // range: the raw empirical tails are noisy from a short recency window.
+    if (TAIL_SHRINK > 0) {
+      const iqr = (row[3] as number) - (row[1] as number);
+      const sd = iqr > 0 ? iqr / 1.34898 : 0;
+      row = row.map((v, j) => (1 - TAIL_SHRINK) * v + TAIL_SHRINK * (med + (Z[j] as number) * sd));
     }
-    rows.push(row);
+    const out = row.map((v) => price6(v));
+    // Enforce non-decreasing quantiles (rounding can tie them, never invert them, but be safe).
+    for (let j = 1; j < out.length; j++) {
+      if ((out[j] as number) < (out[j - 1] as number)) out[j] = out[j - 1] as number;
+    }
+    rows.push(out);
   }
   return rows;
 }
